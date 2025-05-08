@@ -188,17 +188,17 @@ def calmetrics(pred, target, mse_factor=1.0, accthrs=(1.25, 1.25**2, 1.25**3),
     logrms = (np.ma.log(pred_) - np.ma.log(target))
     metrics[0, 2] = np.sqrt((logrms**2).sum() / numPixels)
 
-#     # ④ Abs rel ⑤ Sqr rel
-#     metrics[0, 3] = (np.abs(pred_ - target) / target).sum() / numPixels
-#     metrics[0, 4] = ((pred_ - target)**2 / target).sum() / numPixels
-    # ④ Abs_rel, ⑤ Sqr_rel e를 통해 
+    # ④ Abs rel ⑤ Sqr rel
     mask = target > 0                    # 0 깊이(패딩) 제거
     valid_pred = pred_[mask]
     valid_gt   = target[mask]
 
     abs_rel = (np.abs(valid_pred - valid_gt) / valid_gt).mean()
     sqr_rel = (np.square(valid_pred - valid_gt) / valid_gt).mean()
-
+    
+    metrics[0, 3] = abs_rel
+    metrics[0, 4] = sqr_rel
+  
     # ⑥–⑧ 정확도 a1 a2 a3
     acc = np.maximum(pred_ / target, target / pred_)
     for i, thr in enumerate(accthrs):
@@ -254,7 +254,7 @@ def main():
     saveName = args.logname + "_scale{}_nsck{}_lr{}_ep{}_b{}_lvl{}".format(
         args.FoD_scale, args.stack_num, args.lr, args.epochs, args.batchsize, args.level)
     if args.use_diff > 0:
-        saveName = saveName + '_diffFeat{}'.format(args.use_diff)
+        saveName = saveName + '_deformable{}'.format(args.use_diff)
 
     # log 및 model 저장 폴더 생성
     save_folder = os.path.join(os.path.abspath(args.savemodel), saveName)
