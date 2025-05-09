@@ -109,11 +109,12 @@ class DFFNet(nn.Module):
         # 각 volume shape: (B, C', N, H', W')
 
         # 3) Deformable Fusion 적용 (use_diff==1이면 deformable fusion 사용)
-        if self.use_diff == 1:
-            vol4 = self.deform_fuse4(vol4)  # (B, 128, N, H/32, W/32)
-            vol3 = self.deform_fuse3(vol3)  # (B, 64,  N, H/16, W/16)
-            vol2 = self.deform_fuse2(vol2)  # (B, 32,  N, H/8,  W/8)
-            vol1 = self.deform_fuse1(vol1)  # (B, 16,  N, H/4,  W/4)
+#         if self.use_diff == 1:
+        # 그냥 deformable 무조건 적용
+        vol4 = self.deform_fuse4(vol4)  # (B, 128, N, H/32, W/32)
+        vol3 = self.deform_fuse3(vol3)  # (B, 64,  N, H/16, W/16)
+        vol2 = self.deform_fuse2(vol2)  # (B, 32,  N, H/8,  W/8)
+        vol1 = self.deform_fuse1(vol1)  # (B, 16,  N, H/4,  W/4)
 
         # 4) Decoder
         if self.level == 1:

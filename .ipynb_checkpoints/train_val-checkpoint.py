@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.backends.cudnn as cudnn
 import torch.optim as optim
 import torch.utils.data
+from torch.utils.data import Dataset
 from torch.autograd import Variable
 import torch.nn.functional as F
 import time
@@ -17,6 +18,7 @@ from glob import glob
 import logging
 import numpy as np
 import skimage.filters as skf
+from torch.utils.data import DataLoader
 
 # 표준시 설정
 os.environ['TZ'] = 'Asia/Seoul'
@@ -96,37 +98,79 @@ if args.loadmodel is not None:
 
 # ============ data loader ==============
 #Create data loader
-if  'DDFF12' in args.dataset:
-    from dataloader import DDFF12Loader
-    database = '/data/DFF/my_ddff_trainVal.h5' if args.DDFF12_pth is None else  args.DDFF12_pth
-    DDFF12_train = DDFF12Loader(database, stack_key="stack_train", disp_key="disp_train", n_stack=args.stack_num,
-                                 min_disp=0.02, max_disp=0.28)
-    DDFF12_val = DDFF12Loader(database, stack_key="stack_val", disp_key="disp_val", n_stack=args.stack_num,
-                                      min_disp=0.02, max_disp=0.28, b_test=False)
-    DDFF12_train, DDFF12_val = [DDFF12_train], [DDFF12_val]
-else:
-    DDFF12_train, DDFF12_val = [], []
 
-# 이 데이터셋은 사용 안함
-# if 'FoD500' in args.dataset:
-#     from dataloader import FoD500Loader
-#     database = '/data/DFF/baseline/defocus-net/data/fs_6/' if args.FoD_pth is None else  args.FoD_pth
-#     FoD500_train, FoD500_val = FoD500Loader(database, n_stack=args.stack_num, scale=args.FoD_scale)
-#     FoD500_train, FoD500_val =  [FoD500_train], [FoD500_val]
-# else:
-#     FoD500_train, FoD500_val = [], []
+from dataloader import DDFF12Loader
+database = '/data/DFF/my_ddff_trainVal.h5' if args.DDFF12_pth is None else  args.DDFF12_pth
+# ─── train+val 전체 데이터를 학습에 사용 ───
+DDFF12_train = DDFF12Loader(
+    database,
+    stack_key="stack_train",
+    disp_key="disp_train",
+    n_stack=args.stack_num,
+    min_disp=0.02,
+    max_disp=0.28,
+    b_test=False
+)
+DDFF12_val = DDFF12Loader(
+    database,
+    stack_key="stack_val",
+    disp_key="disp_val",
+    n_stack=args.stack_num,
+    min_disp=0.02,
+    max_disp=0.28,
+    b_test=True
+)
 
-# dataset_train = torch.utils.data.ConcatDataset(DDFF12_train  + FoD500_train )
-# dataset_val = torch.utils.data.ConcatDataset(DDFF12_val) # we use the model perform better on  DDFF12_val
-# DDFF12 데이터셋만 사용하므로
-dataset_train = torch.utils.data.ConcatDataset(DDFF12_train)
-dataset_val = torch.utils.data.ConcatDataset(DDFF12_val)
+# train에는 train+val 모두, val에는 val만
+base_train_ds = torch.utils.data.ConcatDataset([DDFF12_train, DDFF12_val])
+# base_train_ds = torch.utils.data.ConcatDataset([DDFF12_train])
+base_val_ds   = torch.utils.data.ConcatDataset([DDFF12_val])
 
-TrainImgLoader = torch.utils.data.DataLoader(dataset=dataset_train, num_workers=4, batch_size=args.batchsize, shuffle=True, drop_last=True)
-ValImgLoader = torch.utils.data.DataLoader(dataset=dataset_val, num_workers=1, batch_size=12, shuffle=False, drop_last=True)
+class ResizeStackDataset(Dataset):
+    def __init__(self, base_ds, size=(224,224)):
+        self.base_ds = base_ds
+        self.size = size
+
+    def __len__(self):
+        return len(self.base_ds)
+
+    def __getitem__(self, idx):
+        # loader가 (img_stack, gt_disp, foc_dist) 세 튜플을 반환한다고 가정
+        img_stack, gt_disp, foc_dist = self.base_ds[idx]
+
+        # img_stack: Tensor of shape [n_stack, C, H, W]
+        # → 바로 interpolate로 (224,224)로 리사이즈
+        img_stack = F.interpolate(
+            img_stack,
+            size=self.size,
+            mode='bilinear',
+            align_corners=False
+        )
+
+        return img_stack, gt_disp, foc_dist
+
+# 래핑된 dataset
+dataset_train = ResizeStackDataset(base_train_ds, size=(224,224))
+dataset_val   = ResizeStackDataset(base_val_ds,   size=(224,224))
+
+# ============ DataLoader 생성 ============
+TrainImgLoader = DataLoader(
+    dataset=dataset_train,
+    num_workers=4,
+    batch_size=args.batchsize,
+    shuffle=True,
+    drop_last=True
+)
+ValImgLoader = DataLoader(
+    dataset=dataset_val,
+    num_workers=1,
+    batch_size=12,
+    shuffle=False,
+    drop_last=True
+)
+
 
 print('%d batches per epoch'%(len(TrainImgLoader)))
-
 # =========== Train func. =========
 def train(img_stack_in, disp, foc_dist):
     model.train()
@@ -198,7 +242,7 @@ def calmetrics(pred, target, mse_factor=1.0, accthrs=(1.25, 1.25**2, 1.25**3),
     
     metrics[0, 3] = abs_rel
     metrics[0, 4] = sqr_rel
-  
+
     # ⑥–⑧ 정확도 a1 a2 a3
     acc = np.maximum(pred_ / target, target / pred_)
     for i, thr in enumerate(accthrs):
@@ -251,10 +295,10 @@ def adjust_learning_rate(optimizer, epoch):
 
 def main():
     global start_epoch, best_loss, total_iter
-    saveName = args.logname + "_scale{}_nsck{}_lr{}_ep{}_b{}_lvl{}".format(
-        args.FoD_scale, args.stack_num, args.lr, args.epochs, args.batchsize, args.level)
+    saveName = args.logname + "_ep{}_b{}_full".format(
+        args.epochs, args.batchsize)
     if args.use_diff > 0:
-        saveName = saveName + '_deformable{}'.format(args.use_diff)
+        saveName = saveName + '_diff{}_from_DFF-DFV'.format(args.use_diff)
 
     # log 및 model 저장 폴더 생성
     save_folder = os.path.join(os.path.abspath(args.savemodel), saveName)
@@ -370,6 +414,14 @@ def main():
             write_log(viz, img_stack[:,0], img_stack[:,-1], gt_disp,
                       val_log, epoch, thres=0.05)
             val_log.scalar_summary('avg_loss', avg_val_loss, epoch)
+            # 항상 metric 찍기
+            names = ["MSE","RMS","logRMS","Abs_rel","Sqr_rel",
+                          "a1","a2","a3","bump","avgUnc"]
+            metric_str = " | ".join(f"{n:>7}" for n in names)
+            values_str = " | ".join(f"{v:7.5f}" for v in avgmetrics.flatten())
+            msg_metrics = f"[VAL @ epoch {epoch}] {metric_str}\n{values_str}"
+            print(msg_metrics)
+            logging.info(msg_metrics)
 
             # === best 모델 & metric 저장 ===
             if avg_val_loss < best_loss:
@@ -381,15 +433,6 @@ def main():
                     'state_dict': model.state_dict(),
                     'optimize':   optimizer.state_dict(),
                 }, os.path.join(save_folder, 'best.tar'))
-
-                # metric 로그 & 콘솔 출력
-                names = ["MSE","RMS","logRMS","Abs_rel","Sqr_rel",
-                         "a1","a2","a3","bump","avgUnc"]
-                metric_str = " | ".join(["{:>7}".format(n) for n in names])
-                values_str = " | ".join(["{:7.5f}".format(v)
-                                         for v in avgmetrics.flatten()])
-                msg = "[BEST @ epoch {}] {}\n{}".format(epoch, metric_str, values_str)
-                print(msg); logging.info(msg)
 
         torch.cuda.empty_cache()
 

@@ -1,146 +1,91 @@
 import argparse
-import cv2
-from models import DFFNet
-import numpy as np
 import os
-import skimage.filters as skf
 import time
-from models.submodule import *
-
-import  matplotlib
-# matplotlib.use('TkAgg') # 그래픽이 없는 환경이라
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-
+import numpy as np
+import skimage.filters as skf
+import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
-import torchvision
+import torchvision.transforms as transforms
 
-
-'''
-Code for Ours-FV and Ours-DFV evaluation on DDFF-12 dataset  
-'''
-
-# os.environ['CUDA_VISIBLE_DEVICES'] = '1'
-parser = argparse.ArgumentParser(description='DFVDFF')
-parser.add_argument('--data_path', default='./data/DFF/my_ddff_trainVal.h5',help='test data path')
-parser.add_argument('--loadmodel', default=None, help='model path')
-parser.add_argument('--outdir', default='./DDFF12/',help='output dir')
-
-parser.add_argument('--max_disp', type=float ,default=0.28, help='maxium disparity')
-parser.add_argument('--min_disp', type=float ,default=0.02, help='minium disparity')
-
-parser.add_argument('--stack_num', type=int ,default=5, help='num of image in a stack, please take a number in [2, 10], change it according to the loaded checkpoint!')
-parser.add_argument('--use_diff', default=1, choices=[0,1], help='if use differential images as input, change it according to the loaded checkpoint!')
-
-parser.add_argument('--level', type=int, default=4, help='num of layers in network, please take a number in [1, 4]')
-args = parser.parse_args()
-
-# !!! Only for users who download our pre-trained checkpoint, comment the next four line if you are not !!!
-# if os.path.basename(args.loadmodel) == 'DFF-DFV.tar' :
-#     args.use_diff = 1
-# else:
-#     args.use_diff = 0
-
-# dataloader
+from models import DFFNet
 from dataloader import DDFF12Loader
 
-# construct model
-model = DFFNet(clean=False,level=args.level, use_diff=args.use_diff)
-model = nn.DataParallel(model)
-model.cuda()
-ckpt_name = os.path.basename(os.path.dirname(args.loadmodel))
 
-if args.loadmodel is not None:
-    pretrained_dict = torch.load(args.loadmodel)
-#     pretrained_dict['state_dict'] =  {k:v for k,v in pretrained_dict['state_dict'].items() if 'disp' not in k}
-    pretrained_dict['state_dict'] =  {k:v for k,v in pretrained_dict['state_dict'].items()}
-    model.load_state_dict(pretrained_dict['state_dict'],strict=False)
-else:
-    print('run with random init')
-print('Number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
-
-
-def calmetrics( pred, target, mse_factor, accthrs, bumpinessclip=0.05, ignore_zero=True):
-    metrics = np.zeros((1, 7 + len(accthrs)), dtype=float)
-
-    if target.sum() == 0:
+def calmetrics(pred, target, mse_factor=1.0, accthrs=(1.25, 1.25**2, 1.25**3), bumpinessclip=0.05):
+    """
+    Compute evaluation metrics:
+    [MSE, RMS, logRMS, Abs_rel, Sqr_rel, a1, a2, a3, bump, avgUnc]
+    """
+    metrics = np.zeros((1, 10), dtype=float)
+    # filter out padded zeros
+    mask = target > 0
+    if mask.sum() == 0:
         return metrics
+    numPixels = mask.sum()
 
-    pred_ = np.copy(pred)
-    if ignore_zero:
-        pred_[target == 0.0] = 0.0
-        numPixels = (target > 0.0).sum()  # number of valid pixels
-    else:
-        numPixels = target.size
+    # ① MSE & ② RMS
+    diff = pred - target
+    mse = np.square(diff[mask]).sum() / numPixels * mse_factor
+    metrics[0, 0] = mse
+    metrics[0, 1] = np.sqrt(mse)
 
-    # euclidean norm
-    metrics[0, 0] = np.square(pred_ - target).sum() / numPixels * mse_factor
+    # ③ log RMS
+    logrms = np.log(pred[mask]) - np.log(target[mask])
+    metrics[0, 2] = np.sqrt((logrms**2).sum() / numPixels)
 
-    # RMS
-    metrics[0, 1] = np.sqrt(metrics[0, 0])
+    # ④ Abs_rel & ⑤ Sqr_rel
+    valid_pred = pred[mask]
+    valid_gt = target[mask]
+    metrics[0, 3] = np.mean(np.abs(valid_pred - valid_gt) / valid_gt)
+    metrics[0, 4] = np.mean(np.square(valid_pred - valid_gt) / valid_gt)
 
-    # log RMS
-    logrms = (np.ma.log(pred_) - np.ma.log(target))
-    metrics[0, 2] = np.sqrt(np.square(logrms).sum() / numPixels)
-
-    # absolute relative
-    metrics[0, 3] = np.ma.divide(np.abs(pred_ - target), target).sum() / numPixels
-
-    # square relative
-    metrics[0, 4] = np.ma.divide(np.square(pred_ - target), target).sum() / numPixels
-
-    # accuracies
-    acc = np.ma.maximum(np.ma.divide(pred_, target), np.ma.divide(target, pred_))
+    # ⑥–⑧ accuracies a1, a2, a3
+    acc = np.maximum(pred / target, target / pred)
     for i, thr in enumerate(accthrs):
-        metrics[0, 5 + i] = (acc < thr).sum() / numPixels * 100.
+        metrics[0, 5 + i] = np.sum(acc[mask] < thr) / numPixels * 100.0
 
-    # badpix
-    metrics[0, 8] = (np.abs(pred_ - target) > 0.07).sum() / numPixels * 100.
+    # ⑨ bumpiness (Frobenius norm of Hessian)
+    bump = np.zeros_like(diff)
+    for d in (skf.scharr_v(diff), skf.scharr_h(diff)):
+        bump += np.sqrt(skf.scharr_v(d)**2 + skf.scharr_h(d)**2)
+    bump = np.clip(bump, 0, bumpinessclip)
+    metrics[0, 8] = np.sum(bump[mask]) / numPixels * 100.0
 
-    # bumpiness -- Frobenius norm of the Hessian matrix
-    diff = np.asarray(pred - target, dtype='float64')  # PRED or PRED_
-    chn = diff.shape[2] if len(diff.shape) > 2 else 1
-    bumpiness = np.zeros_like(pred_).astype('float')
-    for c in range(0, chn):
-        if chn > 1:
-            diff_ = diff[:, :, c]
-        else:
-            diff_ = diff
-        dx = skf.scharr_v(diff_)
-        dy = skf.scharr_h(diff_)
-        dxx = skf.scharr_v(dx)
-        dxy = skf.scharr_h(dx)
-        dyy = skf.scharr_h(dy)
-        dyx = skf.scharr_v(dy)
-        hessiannorm = np.sqrt(np.square(dxx) + np.square(dxy) + np.square(dyy) + np.square(dyx))
-        bumpiness += np.clip(hessiannorm, 0, bumpinessclip)
-    bumpiness = bumpiness[target > 0].sum() if ignore_zero else bumpiness.sum()
-    metrics[0, 9] = bumpiness / chn / numPixels * 100.
-
+    # ⑩ avgUnc: placeholder (to be overwritten by std.mean())
     return metrics
 
 
 def main(image_size=(383, 552)):
+    parser = argparse.ArgumentParser(description='DFV Evaluation')
+    parser.add_argument('--data_path', default='./data/DFF/my_ddff_trainVal.h5', help='DDFF12 data file')
+    parser.add_argument('--loadmodel', required=True, help='path to trained checkpoint')
+    parser.add_argument('--outdir', default='./DDFF12_eval/', help='output directory')
+    parser.add_argument('--max_disp', type=float, default=0.28)
+    parser.add_argument('--min_disp', type=float, default=0.02)
+    parser.add_argument('--stack_num', type=int, default=5)
+    parser.add_argument('--use_diff', type=int, default=1)
+    parser.add_argument('--level', type=int, default=4)
+    args = parser.parse_args()
+
+    # Load model
+    model = DFFNet(clean=False, level=args.level, use_diff=args.use_diff)
+    model = nn.DataParallel(model).cuda()
+    ckpt = torch.load(args.loadmodel)
+    model.load_state_dict(ckpt['state_dict'], strict=False)
     model.eval()
 
-    # 1) 패딩 크기 계산 (32의 배수)
-    test_pad_size = (
-        int(np.ceil(image_size[0] / 32) * 32),
-        int(np.ceil(image_size[1] / 32) * 32)
-    )
-
-    # 2) 전처리: ToTensor + PadSamples (학습 시 Normalize가 없었다면 여기서도 제거)
-    transform_test = torchvision.transforms.Compose([
+    # Prepare transforms & dataloader
+    pad_h = int(np.ceil(image_size[0] / 32) * 32)
+    pad_w = int(np.ceil(image_size[1] / 32) * 32)
+    transform_test = transforms.Compose([
         DDFF12Loader.ToTensor(),
-        DDFF12Loader.PadSamples(test_pad_size),
-        # DDFF12Loader.Normalize(...)  # 학습 때 Normalize 안 썼다면 주석 유지
+        DDFF12Loader.PadSamples((pad_h, pad_w)),
     ])
-
-    # 3) 데이터로더 생성
     test_set = DDFF12Loader(
         args.data_path,
-        stack_key="stack_val",
-        disp_key="disp_val",
+        stack_key='stack_val',
+        disp_key='disp_val',
         transform=transform_test,
         n_stack=args.stack_num,
         min_disp=args.min_disp,
@@ -149,59 +94,45 @@ def main(image_size=(383, 552)):
     )
     dataloader = DataLoader(test_set, batch_size=1, shuffle=False, num_workers=1)
 
-    # 4) 지표 준비
-    accthrs = [1.25, 1.25**2, 1.25**3]
-    avgmetrics = np.zeros((1, 7 + len(accthrs) + 1), dtype=float)  # +1 for avgUnc
-    test_num = len(dataloader)
-    time_rec = np.zeros(test_num)
+    # Metrics accumulation
+    accthrs = (1.25, 1.25**2, 1.25**3)
+    avgmetrics = np.zeros((1, 10), dtype=float)
+    sample_cnt = 0
+    time_rec = []
 
-    # 5) 평가 루프
-    for inx, (img_stack, disp, foc_dist) in enumerate(dataloader):
-        if inx % 10 == 0:
-            print(f'processing: {inx}/{test_num}')
+    # Evaluation loop
+    with torch.no_grad():
+        for idx, (img_stack, disp, foc_dist) in enumerate(dataloader):
+            if idx % 10 == 0:
+                print(f'Processing sample {idx}/{len(dataloader)}')
 
-        # GPU 로 이동
-        img_stack = img_stack.cuda()
-        gt_disp    = disp.cuda()
+            img_stack = img_stack.cuda()
+            gt_disp = disp.cuda()
 
-        # 5-1) 추론 및 시간 측정, 그리고 바로 NumPy 변환
-        with torch.no_grad():
             torch.cuda.synchronize()
-            start_time = time.time()
-            raw_pred, std, focusMap = model(img_stack, foc_dist.cuda())
+            start_t = time.time()
+            raw_pred, std, _ = model(img_stack, foc_dist.cuda())
             torch.cuda.synchronize()
-            time_rec[inx] = time.time() - start_time
+            time_rec.append(time.time() - start_t)
 
-            pred_disp = raw_pred.squeeze().cpu().numpy()   # (H_pad, W_pad)
-            gt_disp_np = gt_disp.squeeze().cpu().numpy()   # (H_pad, W_pad)
+            # Convert to numpy (remove batch and channel dims)
+            pred_np = raw_pred.squeeze().cpu().numpy()
+            gt_np = gt_disp.squeeze().cpu().numpy()
 
-        # ❶ 지표 계산 (리턴 shape: (1,10))
-        metrics = calmetrics(
-            pred_disp,
-            gt_disp_np,
-            mse_factor=1.0,
-            accthrs=accthrs,
-            bumpinessclip=0.05,
-            ignore_zero=True
-        )
-        metrics = metrics.squeeze(0)  # now shape (10,)
-        # 누적
-        avgmetrics[0, :-1] += metrics
-        avgmetrics[0, -1]  += std.mean().cpu().item()
+            # Compute metrics
+            m = calmetrics(pred_np, gt_np, mse_factor=1.0, accthrs=accthrs)
+            m[0, -1] = std.mean().cpu().item()  # avgUnc
+            avgmetrics += m
+            sample_cnt += 1
 
-        torch.cuda.empty_cache()
-
-    # 6) 최종 결과 출력
-    final_res = (avgmetrics / test_num)[0]
-    final_res = np.delete(final_res, 8)  # badpix 컬럼 제거
-    names = ["MSE", "RMS", "log RMS", "Abs_rel", "Sqr_rel",
-             "a1", "a2", "a3", "bump", "avgUnc"]
-    print('==============  Final result =================')
-    print("  " + " | ".join(f"{n:>7}" for n in names))
-    print("  " + "  ".join(f"{v:7.6f}" for v in final_res.tolist()))
-    print('runtime mean:', np.mean(time_rec[1:]))  # 첫 워밍업 프레임 제외
+    # Final aggregation and print
+    avgmetrics /= sample_cnt
+    names = ["MSE", "RMS", "logRMS", "Abs_rel", "Sqr_rel", "a1", "a2", "a3", "bump", "avgUnc"]
+    print('\n========= Final Evaluation Results =========')
+    print(' | '.join(f"{n:>7}" for n in names))
+    print(' | '.join(f"{v:7.5f}" for v in avgmetrics.flatten()))
+    print(f'Mean inference time (s): {np.mean(time_rec):.4f}')
 
 
 if __name__ == '__main__':
     main()
-
