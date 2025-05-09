@@ -11,14 +11,14 @@ from torch.utils.data import Dataset
 from torch.autograd import Variable
 import torch.nn.functional as F
 import time
-from models import DFFNet
+from models import DFFNet  # model에 따라서 바꿔줘야함
+# from models import DFFNet_deformable
 from utils import logger, write_log
 torch.backends.cudnn.benchmark=True
 from glob import glob
 import logging
 import numpy as np
 import skimage.filters as skf
-from torch.utils.data import DataLoader
 
 # 표준시 설정
 os.environ['TZ'] = 'Asia/Seoul'
@@ -98,77 +98,35 @@ if args.loadmodel is not None:
 
 # ============ data loader ==============
 #Create data loader
+if  'DDFF12' in args.dataset:
+    from dataloader import DDFF12Loader
+    database = '/data/DFF/my_ddff_trainVal.h5' if args.DDFF12_pth is None else  args.DDFF12_pth
+    DDFF12_train = DDFF12Loader(database, stack_key="stack_train", disp_key="disp_train", n_stack=args.stack_num,
+                                 min_disp=0.02, max_disp=0.28)
+    DDFF12_val = DDFF12Loader(database, stack_key="stack_val", disp_key="disp_val", n_stack=args.stack_num,
+                                      min_disp=0.02, max_disp=0.28, b_test=False)
+    DDFF12_train, DDFF12_val = [DDFF12_train], [DDFF12_val]
+else:
+    DDFF12_train, DDFF12_val = [], []
 
-from dataloader import DDFF12Loader
-database = '/data/DFF/my_ddff_trainVal.h5' if args.DDFF12_pth is None else  args.DDFF12_pth
-# ─── train+val 전체 데이터를 학습에 사용 ───
-DDFF12_train = DDFF12Loader(
-    database,
-    stack_key="stack_train",
-    disp_key="disp_train",
-    n_stack=args.stack_num,
-    min_disp=0.02,
-    max_disp=0.28,
-    b_test=False
-)
-DDFF12_val = DDFF12Loader(
-    database,
-    stack_key="stack_val",
-    disp_key="disp_val",
-    n_stack=args.stack_num,
-    min_disp=0.02,
-    max_disp=0.28,
-    b_test=True
-)
+# 이 데이터셋은 사용 안함
+# if 'FoD500' in args.dataset:
+#     from dataloader import FoD500Loader
+#     database = '/data/DFF/baseline/defocus-net/data/fs_6/' if args.FoD_pth is None else  args.FoD_pth
+#     FoD500_train, FoD500_val = FoD500Loader(database, n_stack=args.stack_num, scale=args.FoD_scale)
+#     FoD500_train, FoD500_val =  [FoD500_train], [FoD500_val]
+# else:
+#     FoD500_train, FoD500_val = [], []
 
-# train에는 train+val 모두, val에는 val만
-base_train_ds = torch.utils.data.ConcatDataset([DDFF12_train, DDFF12_val])
-# base_train_ds = torch.utils.data.ConcatDataset([DDFF12_train])
-base_val_ds   = torch.utils.data.ConcatDataset([DDFF12_val])
+# dataset_train = torch.utils.data.ConcatDataset(DDFF12_train  + FoD500_train )
+# dataset_val = torch.utils.data.ConcatDataset(DDFF12_val) # we use the model perform better on  DDFF12_val
+# DDFF12 데이터셋만 사용하므로
+# dataset_train = torch.utils.data.ConcatDataset(DDFF12_train + DDFF12_val)
+dataset_train = torch.utils.data.ConcatDataset(DDFF12_train)
+dataset_val = torch.utils.data.ConcatDataset(DDFF12_val)
 
-class ResizeStackDataset(Dataset):
-    def __init__(self, base_ds, size=(224,224)):
-        self.base_ds = base_ds
-        self.size = size
-
-    def __len__(self):
-        return len(self.base_ds)
-
-    def __getitem__(self, idx):
-        # loader가 (img_stack, gt_disp, foc_dist) 세 튜플을 반환한다고 가정
-        img_stack, gt_disp, foc_dist = self.base_ds[idx]
-
-        # img_stack: Tensor of shape [n_stack, C, H, W]
-        # → 바로 interpolate로 (224,224)로 리사이즈
-        img_stack = F.interpolate(
-            img_stack,
-            size=self.size,
-            mode='bilinear',
-            align_corners=False
-        )
-
-        return img_stack, gt_disp, foc_dist
-
-# 래핑된 dataset
-dataset_train = ResizeStackDataset(base_train_ds, size=(224,224))
-dataset_val   = ResizeStackDataset(base_val_ds,   size=(224,224))
-
-# ============ DataLoader 생성 ============
-TrainImgLoader = DataLoader(
-    dataset=dataset_train,
-    num_workers=4,
-    batch_size=args.batchsize,
-    shuffle=True,
-    drop_last=True
-)
-ValImgLoader = DataLoader(
-    dataset=dataset_val,
-    num_workers=1,
-    batch_size=12,
-    shuffle=False,
-    drop_last=True
-)
-
+TrainImgLoader = torch.utils.data.DataLoader(dataset=dataset_train, num_workers=4, batch_size=args.batchsize, shuffle=True, drop_last=True)
+ValImgLoader = torch.utils.data.DataLoader(dataset=dataset_val, num_workers=1, batch_size=12, shuffle=False, drop_last=True)
 
 print('%d batches per epoch'%(len(TrainImgLoader)))
 # =========== Train func. =========
@@ -295,10 +253,10 @@ def adjust_learning_rate(optimizer, epoch):
 
 def main():
     global start_epoch, best_loss, total_iter
-    saveName = args.logname + "_ep{}_b{}_full".format(
+    saveName = "deformable" + "_ep{}_b{}".format(
         args.epochs, args.batchsize)
     if args.use_diff > 0:
-        saveName = saveName + '_diff{}_from_DFF-DFV'.format(args.use_diff)
+        saveName += '_diff{}_default'.format(args.use_diff)
 
     # log 및 model 저장 폴더 생성
     save_folder = os.path.join(os.path.abspath(args.savemodel), saveName)

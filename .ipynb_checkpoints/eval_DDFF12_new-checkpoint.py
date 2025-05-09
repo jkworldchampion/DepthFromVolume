@@ -8,7 +8,8 @@ import time
 from models.submodule import *
 
 import  matplotlib
-matplotlib.use('TkAgg')
+# matplotlib.use('TkAgg') # 그래픽이 없는 환경이라
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from torch.utils.data import DataLoader
@@ -21,7 +22,7 @@ Code for Ours-FV and Ours-DFV evaluation on DDFF-12 dataset
 
 # os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 parser = argparse.ArgumentParser(description='DFVDFF')
-parser.add_argument('--data_path', default='/data/DFF/my_ddff_trainVal.h5',help='test data path')
+parser.add_argument('--data_path', default='./data/DFF/my_ddff_trainVal.h5',help='test data path')
 parser.add_argument('--loadmodel', default=None, help='model path')
 parser.add_argument('--outdir', default='./DDFF12/',help='output dir')
 
@@ -35,10 +36,10 @@ parser.add_argument('--level', type=int, default=4, help='num of layers in netwo
 args = parser.parse_args()
 
 # !!! Only for users who download our pre-trained checkpoint, comment the next four line if you are not !!!
-if os.path.basename(args.loadmodel) == 'DFF-DFV.tar' :
-    args.use_diff = 1
-else:
-    args.use_diff = 0
+# if os.path.basename(args.loadmodel) == 'DFF-DFV.tar' :
+#     args.use_diff = 1
+# else:
+#     args.use_diff = 0
 
 # dataloader
 from dataloader import DDFF12Loader
@@ -51,7 +52,8 @@ ckpt_name = os.path.basename(os.path.dirname(args.loadmodel))
 
 if args.loadmodel is not None:
     pretrained_dict = torch.load(args.loadmodel)
-    pretrained_dict['state_dict'] =  {k:v for k,v in pretrained_dict['state_dict'].items() if 'disp' not in k}
+#     pretrained_dict['state_dict'] =  {k:v for k,v in pretrained_dict['state_dict'].items() if 'disp' not in k}
+    pretrained_dict['state_dict'] =  {k:v for k,v in pretrained_dict['state_dict'].items()}
     model.load_state_dict(pretrained_dict['state_dict'],strict=False)
 else:
     print('run with random init')
@@ -127,7 +129,8 @@ def main(image_size = (383, 552)):
     # Create test set transforms
     transform_test = [DDFF12Loader.ToTensor(),
                       DDFF12Loader.PadSamples(test_pad_size),
-                      DDFF12Loader.Normalize(mean_input=[0.485, 0.456, 0.406],std_input=[0.229, 0.224, 0.225])]
+#                       DDFF12Loader.Normalize(mean_input=[0.485, 0.456, 0.406],std_input=[0.229, 0.224, 0.225])
+                     ]
     transform_test = torchvision.transforms.Compose(transform_test)
 
     test_set = DDFF12Loader(args.data_path, stack_key="stack_val", disp_key="disp_val", transform=transform_test,
